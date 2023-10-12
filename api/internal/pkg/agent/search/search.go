@@ -9,8 +9,9 @@ import (
 	"strings"
 	"time"
 
-	db2 "github.com/clickvisual/clickvisual/api/internal/pkg/model/db"
 	"github.com/gotomicro/ego/core/elog"
+
+	db2 "github.com/clickvisual/clickvisual/api/internal/pkg/model/db"
 )
 
 // isSearchTime 根据时间搜索到数据
@@ -23,7 +24,7 @@ func (c *Component) isSearchByStartTime(value string) bool {
 	if indexValue == -1 {
 		return false
 	}
-	curTimeParser, err := time.Parse(time.DateTime, curTime)
+	curTimeParser, err := time.ParseInLocation(time.DateTime, curTime, time.Local)
 	if err != nil {
 		panic(err)
 	}
@@ -38,7 +39,7 @@ func (c *Component) isSearchByEndTime(value string) bool {
 	if indexValue == -1 {
 		return false
 	}
-	curTimeParser, err := time.Parse(time.DateTime, curTime)
+	curTimeParser, err := time.ParseInLocation(time.DateTime, curTime, time.Local)
 	if err != nil {
 		panic(err)
 	}
@@ -167,6 +168,27 @@ func (c *Component) searchByWord(startPos, endPos int64) (int64, error) {
 	return 0, nil
 }
 
+func (c *Component) calcLines(startPos, endPos int64) int64 {
+	// 游标去掉一部分数据
+	_, err := c.file.ptr.Seek(startPos, io.SeekStart)
+	if err != nil {
+		panic(err)
+	}
+	i := 0
+	var count int64 = 0
+	// 在读取这个内容
+	scanner := bufio.NewScanner(c.file.ptr)
+	for scanner.Scan() {
+		// 超过位置，直接退出
+		if int64(i) > endPos {
+			break
+		}
+		i += len(scanner.Text())
+		count++
+	}
+	return count
+}
+
 func (c *Component) parseHitLog(line string) (log map[string]interface{}, err error) {
 	log = make(map[string]interface{})
 	for _, word := range c.words {
@@ -177,15 +199,23 @@ func (c *Component) parseHitLog(line string) (log map[string]interface{}, err er
 	if indexValue == -1 {
 		return
 	}
-	curTimeParser, err := time.Parse(time.DateTime, curTime)
+	curTimeParser, err := time.ParseInLocation(time.DateTime, curTime, time.Local)
 	if err != nil {
 		elog.Error("agent log parse timestamp error", elog.FieldErr(err))
 		panic(err)
 	}
 	ts := curTimeParser.Unix()
+
+	// 根据时间偏移量统计
+	if c.IsChartsRequest() {
+		offset := (ts - c.startTime) / c.interval
+		c.charts[offset]++
+		// fmt.Printf("parseHitLog ts: %d,  offse: %d, charts: %d", ts, offset, c.charts[offset])
+	}
+
 	log["ts"] = ts
 	log["body"] = line
-	log[db2.TimeFieldNanoseconds] = curTimeParser.Nanosecond()
+	log[db2.TimeFieldNanoseconds] = curTimeParser.UnixNano()
 	log[db2.TimeFieldSecond] = ts
 	return
 }
@@ -224,14 +254,14 @@ func (c *Component) searchByBackWord(startPos, endPos int64) (logs []map[string]
 					}
 				}
 
-				if i == c.limit {
+				if !c.IsChartsRequest() && i == c.limit {
 					break
 				}
 				i++
 			}
 		} else {
 			c.output = append(c.output, line)
-			if i == c.limit {
+			if !c.IsChartsRequest() && i == c.limit {
 				break
 			}
 			i++

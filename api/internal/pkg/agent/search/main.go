@@ -6,8 +6,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/clickvisual/clickvisual/api/internal/pkg/cvdocker"
 	"github.com/gotomicro/ego/core/elog"
+
+	"github.com/clickvisual/clickvisual/api/internal/pkg/cvdocker"
+
+	view2 "github.com/clickvisual/clickvisual/api/internal/pkg/model/view"
 )
 
 type Container struct {
@@ -16,7 +19,7 @@ type Container struct {
 
 // Component 每个执行指令地方
 type Component struct {
-	isCommand   bool // 是否命令行
+	request     Request
 	file        *File
 	startTime   int64
 	endTime     int64
@@ -26,6 +29,8 @@ type Component struct {
 	limit       int64
 	output      []string
 	logs        []map[string]interface{}
+	charts      map[int64]int64 // key: offset, value: count
+	interval    int64
 }
 
 type KeySearch struct {
@@ -46,6 +51,14 @@ type CmdRequest struct {
 	K8SContainer []string
 }
 
+func (req *Request) IsChartsRequest() bool {
+	return req.Interval > 0
+}
+
+func (c *Component) IsChartsRequest() bool {
+	return c.interval > 0
+}
+
 func (c CmdRequest) ToRequest() Request {
 	var (
 		st int64
@@ -53,7 +66,7 @@ func (c CmdRequest) ToRequest() Request {
 	)
 
 	if c.StartTime != "" {
-		sDate, err := time.Parse(time.DateTime, c.StartTime)
+		sDate, err := time.ParseInLocation(time.DateTime, c.StartTime, time.Local)
 		st = sDate.Unix()
 		if err != nil {
 			elog.Panic("parse start time error", elog.FieldErr(err))
@@ -61,7 +74,7 @@ func (c CmdRequest) ToRequest() Request {
 	}
 
 	if c.EndTime != "" {
-		eDate, err := time.Parse(time.DateTime, c.EndTime)
+		eDate, err := time.ParseInLocation(time.DateTime, c.EndTime, time.Local)
 		et = eDate.Unix()
 		if err != nil {
 			elog.Panic("parse end time error", elog.FieldErr(err))
@@ -83,25 +96,32 @@ func (c CmdRequest) ToRequest() Request {
 }
 
 type Request struct {
-	StartTime    int64
-	EndTime      int64
-	Date         string // last 30min,6h,1d,7d
-	Path         string // 文件路径
-	Dir          string // 文件夹路径
-	TruePath     []string
-	KeyWord      string // 搜索的关键词
-	Limit        int64  // 最少多少条数据
-	IsCommand    bool   // 是否是命令行 默认不是
-	IsK8S        bool
-	K8SContainer []string
+	StartTime     int64
+	EndTime       int64
+	Date          string // last 30min,6h,1d,7d
+	Path          string // 文件路径
+	Dir           string // 文件夹路径
+	TruePath      []string
+	KeyWord       string // 搜索的关键词
+	Limit         int64  // 最少多少条数据
+	Interval      int64
+	IsCommand     bool // 是否是命令行 默认不是
+	IsK8S         bool
+	K8SContainer  []string
+	K8sClientType string // 是 containerd，还是docker
+}
+type FileSearchResp struct {
+	Logs   []map[string]interface{}
+	Charts []*view2.HighChart
 }
 
-func Run(req Request) (logs []map[string]interface{}, err error) {
+func Run(req Request) (resp FileSearchResp, err error) {
 	var filePaths []string
 	// 如果filename为空字符串，分割会得到一个长度为1的空字符串数组
-
+	// todo 需要做优化，不用重复new
 	if req.IsK8S {
 		obj := cvdocker.NewContainer()
+		req.K8sClientType = obj.ClientType
 		containers := obj.GetActiveContainers()
 		for _, value := range containers {
 			if len(req.K8SContainer) == 0 {
@@ -128,7 +148,7 @@ func Run(req Request) (logs []map[string]interface{}, err error) {
 		panic("file cant empty")
 	}
 	// 多了没意义，自动变为 50，提示用户
-	if req.Limit <= 0 || req.Limit > 500 {
+	if !req.IsChartsRequest() && (req.Limit <= 0 || req.Limit > 500) {
 		req.Limit = 50
 		elog.Info("limit exceeds 500. it will be automatically set to 50", elog.Int64("limit", req.Limit))
 	}
@@ -140,7 +160,10 @@ func Run(req Request) (logs []map[string]interface{}, err error) {
 	for _, pathName := range filePaths {
 		value := pathName
 		go func() {
-			comp := NewComponent(req.StartTime, req.EndTime, value, req.KeyWord, req.Limit, req.IsCommand)
+			comp := NewComponent(
+				value,
+				req,
+			)
 			if req.KeyWord != "" && len(comp.words) == 0 {
 				elog.Error("-k format is error", elog.FieldErr(err))
 				l.Done()
@@ -153,36 +176,65 @@ func Run(req Request) (logs []map[string]interface{}, err error) {
 	}
 	l.Wait()
 
-	if req.IsCommand {
-		for _, comp := range container.components {
-			fmt.Println(comp.bash.ColorAll(comp.file.path))
-			for _, value := range comp.output {
-				fmt.Println(value)
+	// true if this request for logs
+	if !req.IsChartsRequest() {
+		if req.IsCommand {
+			for _, comp := range container.components {
+				fmt.Println(comp.bash.ColorAll(comp.file.path))
+				for _, value := range comp.output {
+					fmt.Println(value)
+				}
+			}
+		} else {
+			resp.Logs = make([]map[string]interface{}, 0)
+			for _, comp := range container.components {
+				resp.Logs = append(resp.Logs, comp.logs...)
 			}
 		}
-	} else {
-		logs = make([]map[string]interface{}, 0)
-		for _, comp := range container.components {
-			logs = append(logs, comp.logs...)
-		}
+		return
 	}
-	return logs, nil
+
+	resp.Charts = make([]*view2.HighChart, 0)
+	times := (req.EndTime - req.StartTime) / req.Interval
+	var i int64 = 0
+
+	for i < times {
+		var total int64 = 0
+		for _, comp := range container.components {
+			if count, ok := comp.charts[i]; ok {
+				total += count
+			}
+		}
+		if total != 0 {
+			resp.Charts = append(resp.Charts, &view2.HighChart{
+				Count: uint64(total),
+				From:  req.StartTime + i*req.Interval,
+				To:    min(req.StartTime+(i+1)*req.Interval, req.EndTime),
+			})
+		}
+		i++
+	}
+	return
 }
 
-func NewComponent(startTime int64, endTime int64, filename string, keyWord string, limit int64, isCommand bool) *Component {
+func NewComponent(filename string, req Request) *Component {
 	obj := &Component{}
 	file, err := OpenFile(filename)
 	if err != nil {
 		elog.Error("agent open log file error", elog.FieldErr(err), elog.String("path", filename))
 	}
-
+	// request for charts
+	if req.Interval > 0 {
+		obj.charts = make(map[int64]int64)
+	}
+	obj.interval = req.Interval
 	obj.file = file
-	obj.startTime = startTime
-	obj.endTime = endTime
-	obj.isCommand = isCommand
+	obj.startTime = req.StartTime
+	obj.endTime = req.EndTime
+	obj.request = req
 	words := make([]KeySearch, 0)
 
-	arrs := strings.Split(keyWord, "and")
+	arrs := strings.Split(req.KeyWord, "and")
 	for _, value := range arrs {
 		if strings.Contains(value, "=") {
 			info := strings.Split(value, "=")
@@ -209,7 +261,7 @@ func NewComponent(startTime int64, endTime int64, filename string, keyWord strin
 	}
 	obj.filterWords = filterString
 	obj.bash = NewBash()
-	obj.limit = limit
+	obj.limit = req.Limit
 	return obj
 }
 
@@ -240,6 +292,39 @@ func (c *Component) SearchFile() ([]map[string]interface{}, error) {
 			elog.Error("agent search ts error", elog.FieldErr(err))
 		}
 	}
+
+	if c.IsChartsRequest() && len(c.filterWords) == 0 {
+		times := (c.endTime - c.startTime) / c.interval
+		originStartTime, originEndTime := c.startTime, c.endTime
+		var i int64
+		var endTime int64
+		st := c.startTime
+		for i = 1; i <= times; i++ {
+			endTime = max(st+i*c.interval, originEndTime)
+			c.startTime, c.endTime = st, endTime
+			end, err = c.searchByEndTime()
+			if err != nil {
+				elog.Error("agent search ts error", elog.FieldErr(err))
+				panic("agent search timestamp error")
+			}
+			// if true, after this turn, endTime will be larger, end always be -1
+			if end == -1 {
+				t := i
+				for t <= times {
+					c.charts[t-1] = 0
+					t++
+				}
+				break
+			}
+
+			count := c.calcLines(start, end)
+			c.charts[i-1] = count
+			start = end + 2
+		}
+		c.startTime, c.endTime = originStartTime, originEndTime
+		return nil, nil
+	}
+
 	if start != -1 && start <= end {
 		_, err = c.searchByBackWord(start, end)
 		if err != nil {
