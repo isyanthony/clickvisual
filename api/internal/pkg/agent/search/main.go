@@ -1,6 +1,8 @@
 package search
 
 import (
+	"bufio"
+	"context"
 	"fmt"
 	"strings"
 	"sync"
@@ -9,8 +11,8 @@ import (
 	"github.com/gotomicro/ego/core/elog"
 
 	"github.com/clickvisual/clickvisual/api/internal/pkg/cvdocker"
-
 	view2 "github.com/clickvisual/clickvisual/api/internal/pkg/model/view"
+	"github.com/clickvisual/clickvisual/api/internal/pkg/utils/gopool"
 )
 
 type Container struct {
@@ -30,6 +32,7 @@ type Component struct {
 	output      []string
 	logs        []map[string]interface{}
 	charts      map[int64]int64 // key: offset, value: count
+	maxTimes    int64           // 记录该文件下最大的时间 offset
 	interval    int64
 }
 
@@ -66,7 +69,7 @@ func (c CmdRequest) ToRequest() Request {
 	)
 
 	if c.StartTime != "" {
-		sDate, err := time.Parse(time.DateTime, c.StartTime)
+		sDate, err := time.ParseInLocation(time.DateTime, c.StartTime, time.Local)
 		st = sDate.Unix()
 		if err != nil {
 			elog.Panic("parse start time error", elog.FieldErr(err))
@@ -74,7 +77,7 @@ func (c CmdRequest) ToRequest() Request {
 	}
 
 	if c.EndTime != "" {
-		eDate, err := time.Parse(time.DateTime, c.EndTime)
+		eDate, err := time.ParseInLocation(time.DateTime, c.EndTime, time.Local)
 		et = eDate.Unix()
 		if err != nil {
 			elog.Panic("parse end time error", elog.FieldErr(err))
@@ -96,18 +99,18 @@ func (c CmdRequest) ToRequest() Request {
 }
 
 type Request struct {
-	StartTime    int64
-	EndTime      int64
-	Date         string // last 30min,6h,1d,7d
-	Path         string // 文件路径
-	Dir          string // 文件夹路径
-	TruePath     []string
-	KeyWord      string // 搜索的关键词
-	Limit        int64  // 最少多少条数据
-	Interval     int64
-	IsCommand    bool // 是否是命令行 默认不是
-	IsK8S        bool
-	K8SContainer []string
+	StartTime     int64
+	EndTime       int64
+	Date          string // last 30min,6h,1d,7d
+	Path          string // 文件路径
+	Dir           string // 文件夹路径
+	TruePath      []string
+	KeyWord       string // 搜索的关键词
+	Limit         int64  // 最少多少条数据
+	Interval      int64  // calc 后的标准时间间隔
+	IsCommand     bool   // 是否是命令行 默认不是
+	IsK8S         bool
+	K8SContainer  []string
 	K8sClientType string // 是 containerd，还是docker
 }
 type FileSearchResp struct {
@@ -198,20 +201,35 @@ func Run(req Request) (resp FileSearchResp, err error) {
 	times := (req.EndTime - req.StartTime) / req.Interval
 	var i int64 = 0
 
+	wrote := false
+	maxTimes := int64(0)
 	for i < times {
 		var total int64 = 0
-		for _, comp := range container.components {
+		for j, comp := range container.components {
+			if j == 0 {
+				if comp.maxTimes > maxTimes {
+					maxTimes = comp.maxTimes
+				}
+			}
 			if count, ok := comp.charts[i]; ok {
 				total += count
 			}
 		}
-		if total != 0 {
-			to := max(req.StartTime+(i+1)*req.Interval, req.EndTime)
+
+		// API layer will scan data and add head 、tail zero count interval, so we need to adapt
+		// filter head and tail zero count interval
+		if (wrote && i < maxTimes) || total != 0 {
+			wrote = true
+			endTime := req.StartTime + (i+1)*req.Interval
+			if endTime > req.EndTime {
+				endTime = req.EndTime
+			}
 			resp.Charts = append(resp.Charts, &view2.HighChart{
 				Count: uint64(total),
 				From:  req.StartTime + i*req.Interval,
-				To:    to,
+				To:    endTime,
 			})
+			// fmt.Printf("i: %d, startTime: %d, endTime: %d, interval: %d\n", req.StartTime+i*req.Interval, endTime, req.Interval, i)
 		}
 		i++
 	}
@@ -225,7 +243,7 @@ func NewComponent(filename string, req Request) *Component {
 		elog.Error("agent open log file error", elog.FieldErr(err), elog.String("path", filename))
 	}
 	// request for charts
-	if req.Interval > 0 {
+	if req.IsChartsRequest() {
 		obj.charts = make(map[int64]int64)
 	}
 	obj.interval = req.Interval
@@ -294,16 +312,18 @@ func (c *Component) SearchFile() ([]map[string]interface{}, error) {
 		}
 	}
 
-	// 如果需要聚合计算图表, 并且没有过滤条件，使用更加快捷的扫描
 	if c.IsChartsRequest() && len(c.filterWords) == 0 {
-		times := (c.endTime - c.startTime) / c.interval
+		/*times := (c.endTime - c.startTime) / c.interval
 		originStartTime, originEndTime := c.startTime, c.endTime
 		var i int64
 		var endTime int64
 		st := c.startTime
 		for i = 1; i <= times; i++ {
-			endTime = max(st+i*c.interval, originEndTime)
-			c.startTime, c.endTime = st, endTime
+			endTime = st + i*c.interval
+			if endTime > originEndTime {
+				endTime = originEndTime
+			}
+			c.endTime = endTime
 			end, err = c.searchByEndTime()
 			if err != nil {
 				elog.Error("agent search ts error", elog.FieldErr(err))
@@ -311,19 +331,16 @@ func (c *Component) SearchFile() ([]map[string]interface{}, error) {
 			}
 			// if true, after this turn, endTime will be larger, end always be -1
 			if end == -1 {
-				t := i
-				for t <= times {
-					c.charts[t-1] = 0
-					t++
-				}
 				break
 			}
 
 			count := c.calcLines(start, end)
 			c.charts[i-1] = count
+			c.maxTimes = i - 1
 			start = end + 2
 		}
-		c.startTime, c.endTime = originStartTime, originEndTime
+		c.startTime, c.endTime = originStartTime, originEndTime*/
+		c.getCharts()
 		return nil, nil
 	}
 
@@ -340,4 +357,83 @@ func (c *Component) SearchFile() ([]map[string]interface{}, error) {
 	}
 	elog.Info("agent log search nothing", elog.Any("words", c.words))
 	return nil, nil
+}
+
+func calc(startTime, endTime, interval int64, path string) (offset, count int64) {
+	file, err := OpenFile(path)
+	if err != nil {
+		panic(err)
+	}
+	offset = startTime / interval
+
+	cc := Component{
+		startTime: startTime,
+		endTime:   endTime,
+		file:      file,
+	}
+	startPos, _ := cc.searchByStartTime()
+	endPos, _ := cc.searchByEndTime()
+	file.ptr.Seek(startPos, 0)
+	scanner := bufio.NewScanner(file.ptr)
+	count = 0
+	i := 0
+	for scanner.Scan() {
+		if endPos < int64(i) {
+			file.ptr.Close()
+			break
+		}
+		i += len(scanner.Text())
+		count++
+		fmt.Printf("### scan count %d, time: %d\n", offset, startTime)
+	}
+	return
+}
+
+func (c *Component) getCharts() {
+	n := int((c.endTime - c.startTime) / c.interval)
+	intervals := make([]int64, n)
+	intervals[0] = c.startTime
+	for i := 1; i < n; i++ {
+		intervals[i] = intervals[i-1] + c.interval
+	}
+
+	if intervals[n-1] > c.endTime {
+		intervals[n-1] = c.endTime
+	}
+
+	pool := gopool.NewPool("log-charts", int32(2), gopool.NewConfig())
+	fmt.Println("poolSize: ", pool.WorkerCount())
+
+	var wg sync.WaitGroup
+
+	channel := make(chan [2]int64, n)
+	ctx, cancle := context.WithCancel(context.Background())
+	wg.Add(n)
+	for i := 0; i < n-1; i++ {
+		go func() {
+			offset, count := calc(intervals[i], intervals[i+1], c.interval, c.file.path)
+			fmt.Printf("offset: %d, count: %d\n", offset, count)
+			channel <- [2]int64{offset, count}
+			wg.Done()
+		}()
+		fmt.Printf("submit %d 任务～\n", i)
+	}
+
+	go func() {
+		for {
+			select {
+			case ch := <-channel:
+				c.charts[ch[0]] = ch[1]
+			case <-ctx.Done():
+				close(channel)
+				return
+			}
+		}
+	}()
+
+	fmt.Println("wait for pool run1")
+	wg.Wait()
+	fmt.Println("wait for pool run over")
+	cancle()
+	fmt.Println("wait for pool run orver -2")
 }
