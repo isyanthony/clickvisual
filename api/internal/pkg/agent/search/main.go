@@ -160,6 +160,8 @@ func Run(req Request) (resp FileSearchResp, err error) {
 	l := sync.WaitGroup{}
 	// 文件添加并发查找
 	l.Add(len(filePaths))
+	// fmt.Println("files len: ", len(filePaths))
+	// now := time.Now()
 	for _, pathName := range filePaths {
 		value := pathName
 		go func() {
@@ -174,10 +176,13 @@ func Run(req Request) (resp FileSearchResp, err error) {
 			}
 			container.components = append(container.components, comp)
 			comp.SearchFile()
+			comp.file.ptr.Close()
 			l.Done()
 		}()
 	}
 	l.Wait()
+	// delta := time.Since(now)
+	// fmt.Println("Agent Goroutine Search File Time: ", delta)
 
 	// true if this request for logs
 	if !req.IsChartsRequest() {
@@ -293,12 +298,55 @@ func (c *Component) SearchFile() ([]map[string]interface{}, error) {
 	if c.file.size == 0 {
 		panic("file size is 0")
 	}
-
 	var (
 		start = int64(0)
 		end   = c.file.size
 		err   error
 	)
+	if c.IsChartsRequest() && len(c.filterWords) == 0 {
+		// now := time.Now()
+		times := (c.endTime - c.startTime) / c.interval
+		// times = 1
+		originStartTime, originEndTime := c.startTime, c.endTime
+		var i int64
+		var endTime int64
+		st := c.startTime
+		// fmt.Printf("########## Start: %d, End: %d\n", start, end)
+		for i = 1; i <= times; i++ {
+			endTime = st + i*c.interval
+			if endTime > originEndTime {
+				endTime = originEndTime
+			}
+			c.endTime = endTime
+			// searhEndTime := time.Now()
+			end, err = c.searchByEndTime()
+			// delat := time.Since(searhEndTime)
+			// fmt.Printf("Agent SearchByEndTime cnt: %d, file: %s, Use Time: %d\n", i, c.file.path, delat.Milliseconds())
+			if err != nil {
+				elog.Error("agent search ts error", elog.FieldErr(err))
+				panic("agent search timestamp error")
+			}
+			// if true, after this turn, endTime will be larger, end always be -1
+			if end == -1 {
+				continue
+			}
+
+			// calcTime := time.Now()
+			// fmt.Printf("########## Start: %d, End: %d\n", start, end)
+			count := c.calcLinesGoroutine(start, end)
+			// delat := time.Since(calcTime)
+			// fmt.Printf("Agent calcLines cnt: %d, file: %s, Use Time: %d\n", i, c.file.path, delat.Milliseconds())
+			c.charts[i-1] = count
+			c.maxTimes = i - 1
+			start = end + 2
+		}
+		c.startTime, c.endTime = originStartTime, originEndTime
+
+		// delta := time.Since(now)
+		// fmt.Printf("Agent Aggregate logs, file: %s, Use Time: %d\n", c.file.path, delta.Milliseconds())
+		return nil, nil
+	}
+
 	if c.startTime > 0 {
 		start, err = c.searchByStartTime()
 		if err != nil {
@@ -312,44 +360,17 @@ func (c *Component) SearchFile() ([]map[string]interface{}, error) {
 		}
 	}
 
-	if c.IsChartsRequest() && len(c.filterWords) == 0 {
-		/*times := (c.endTime - c.startTime) / c.interval
-		originStartTime, originEndTime := c.startTime, c.endTime
-		var i int64
-		var endTime int64
-		st := c.startTime
-		for i = 1; i <= times; i++ {
-			endTime = st + i*c.interval
-			if endTime > originEndTime {
-				endTime = originEndTime
-			}
-			c.endTime = endTime
-			end, err = c.searchByEndTime()
-			if err != nil {
-				elog.Error("agent search ts error", elog.FieldErr(err))
-				panic("agent search timestamp error")
-			}
-			// if true, after this turn, endTime will be larger, end always be -1
-			if end == -1 {
-				break
-			}
-
-			count := c.calcLines(start, end)
-			c.charts[i-1] = count
-			c.maxTimes = i - 1
-			start = end + 2
-		}
-		c.startTime, c.endTime = originStartTime, originEndTime*/
-		c.getCharts()
-		return nil, nil
-	}
-
 	if start != -1 && start <= end {
-		_, err = c.searchByBackWord(start, end)
-		if err != nil {
-
+		if c.IsChartsRequest() {
+			c.searchChartsByBackWord(start, end)
+			return nil, nil
+		} else {
+			_, err = c.searchByBackWord(start, end)
+			if err != nil {
+				elog.Error("searchByBackWord error", elog.FieldErr(err))
+				return nil, nil
+			}
 		}
-
 		if len(c.logs) == 0 {
 			elog.Info("agent log search nothing", elog.Any("words", c.words))
 		}
@@ -402,7 +423,6 @@ func (c *Component) getCharts() {
 	}
 
 	pool := gopool.NewPool("log-charts", int32(2), gopool.NewConfig())
-	fmt.Println("poolSize: ", pool.WorkerCount())
 
 	var wg sync.WaitGroup
 
@@ -410,14 +430,15 @@ func (c *Component) getCharts() {
 	ctx, cancle := context.WithCancel(context.Background())
 	wg.Add(n)
 	for i := 0; i < n-1; i++ {
-		go func() {
+		pool.Go(func() {
 			offset, count := calc(intervals[i], intervals[i+1], c.interval, c.file.path)
 			fmt.Printf("offset: %d, count: %d\n", offset, count)
 			channel <- [2]int64{offset, count}
 			wg.Done()
-		}()
+		})
 		fmt.Printf("submit %d 任务～\n", i)
 	}
+	fmt.Println("poolSize: ", pool.WorkerCount())
 
 	go func() {
 		for {
