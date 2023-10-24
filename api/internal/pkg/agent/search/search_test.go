@@ -19,7 +19,7 @@ func TestGoroutineCalc(t *testing.T) {
 		Limit:          499,
 		// Dir: "./logs",
 		KeyWord:  "lv=info and comp=Timeout exceeded",
-		Interval: ChartsIntervalConvert(st, et),
+		Interval: ChartsIntervalConvert(et - st),
 	}
 	resp, _ := RunCharts(req)
 

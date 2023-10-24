@@ -55,6 +55,9 @@ func (c *Component) IsChartRequest() bool {
 	return c.interval > 0
 }
 
+// preparePartition
+// 搜索 charts 时会进行分片，此处需要根据机器配置进行调整
+// 搜索 logs 由于是基于内存 buffer 从 tail -> head 进行扫描，串形扫
 func (c *Component) preparePartition(from, to int64) {
 	size := to - from + 1
 	switch {

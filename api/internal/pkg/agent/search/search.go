@@ -18,10 +18,13 @@ import (
 
 var (
 	pool *ants.Pool
-	wg   sync.WaitGroup
 )
 
 func init() {
+
+	// 主要用于限制 gorotine 数量，由于搜索时读取会进行多次分配内存
+	// 搜索文件较多，文件较大时，可能会出现 OOM 的风险
+	// 此处可以根据机器配置自行设置大小
 	p, err := ants.NewPool(10, ants.WithOptions(ants.Options{
 		ExpiryDuration:   time.Minute,
 		MaxBlockingTasks: 30,
@@ -232,9 +235,11 @@ func (c *Component) searchLogs(startPos, endPos, remainedLines int64) (int64, er
 		limit             = remainedLines
 	)
 
+	// 由于最后一行可能不会有换行符，匹配可能会漏掉
 	includeFileEnd := now == c.file.size-1 || now == c.file.size-2
 
 	for {
+		// 避免处理多余的数据
 		readStartPos := now - basicSize
 		if readStartPos <= 0 {
 			readStartPos = 0
@@ -249,7 +254,7 @@ func (c *Component) searchLogs(startPos, endPos, remainedLines int64) (int64, er
 
 		data = append(data, fileReader...)
 
-		// '\n' in the last line will be ingored, so need to append it
+		// '\n' in the last line will be ignored, so need to append it
 		if includeFileEnd {
 			data = append(data, '\n')
 			includeFileEnd = false
@@ -269,11 +274,10 @@ func (c *Component) getLogs(startPos, endPos int64) (error error) {
 	partitions := c.calcPartitionInterval(2, startPos, endPos)
 	remainedLines := c.limit
 
+	// TODO: 目前最大 500 条, 后续如果耗时较高可改为分片扫，但是会增加排序和过滤数据的成本
 	// logs need the latest record, so need to search from the end side
 	for i := 1; i >= 0; i-- {
-		// fmt.Println("partitions: ", partitions[i][0], partitions[i][1])
 		lines, err := c.searchLogs(partitions[i][0], partitions[i][1], remainedLines)
-		// fmt.Println("lines: ", lines)
 		if err != nil {
 			return err
 		}
@@ -466,7 +470,13 @@ func (c *Component) calcPartitionInterval(n int, start, end int64) [][2]int64 {
 	return resp
 }
 
+// doGetLogs search log line matched filterWords from tail to head
+// data: 待匹配数据
+// tailLine: 上一轮匹配中不完整的首行数据
+// limit: 需要匹配的累计行数
 func (c *Component) doGetLogs(data []byte, tailLine []byte, limit int64) (lines int64, beforeLine []byte) {
+	// {xxxx}br2{xxxxxxx}br1
+	// data[br2+1:br1] is a line
 	var (
 		br1            int = -1
 		br2            int = -1
@@ -478,12 +488,14 @@ func (c *Component) doGetLogs(data []byte, tailLine []byte, limit int64) (lines 
 		data = append(data, beforeLine...)
 	}
 
+	// 为了保持下面逻辑一致,这里做数据格式的统一, 开头没有换行符，末尾有换行符号
 	if data[0] == '\n' {
 		beforeLine = append(beforeLine, '\n')
 		data = data[1:]
 	} else {
 		firstLinePos := bytes.Index(data, []byte{'\n'})
 		if firstLinePos != -1 {
+			// must clone data, because data will be modified in next turn
 			beforeLine = append(beforeLine, bytes.Clone(data[:firstLinePos+1])...)
 		} else {
 			beforeLine = append(beforeLine, bytes.Clone(data)...)
@@ -495,7 +507,9 @@ func (c *Component) doGetLogs(data []byte, tailLine []byte, limit int64) (lines 
 	br1 = bytes.LastIndexByte(data, '\n')
 	br2 = bytes.LastIndexByte(data[:br1], '\n')
 
+	// 只剩第一行了
 	if br2 == -1 {
+		// 匹配关键字
 		_, ok, _ = c.verifyKeyWords(data[:br1], c.filterWords, br1, nil)
 		if ok {
 			c.output = append(c.output, string(data[:br1]))
@@ -506,6 +520,7 @@ func (c *Component) doGetLogs(data []byte, tailLine []byte, limit int64) (lines 
 
 	for br2 != -1 {
 		flag := true
+		// 没有关键字匹配直接跳过
 		if hasFilterWords {
 			for _, v := range c.filterWords {
 				p := bytes.LastIndex(data[:br1], []byte(v))
@@ -513,8 +528,11 @@ func (c *Component) doGetLogs(data []byte, tailLine []byte, limit int64) (lines 
 					return limit, tailLine
 				}
 
+				// valid -> br2 ****p**** br1
+				// invalid -> p** br2 ******* br1, need to skip lines
 				if p <= br2 {
 					flag = false
+					// skip lines, 向前面进行匹配
 					for p <= br2 {
 						br1 = br2
 						pos := bytes.LastIndexByte(data[:br2], '\n')
