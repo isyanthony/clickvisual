@@ -71,14 +71,12 @@ func searchCharts(query view.ReqQuery) []*view.HighChart {
 
 func TestAgentCharts(t *testing.T) {
 
-	start := time.Now().Unix() - 60*60*24*365*5
 	req := view.ReqQuery{
-		ST:   start,
-		ET:   start + 60*60*24*365*5,
-		Path: "./ego2.sys",
+		ST: 1698717600,
+		ET: 1698736246,
+		// Path: "./ego2.sys",
 		// Dir:      "/Users/jingyang/Desktop/project/isyanthony/clickvisual/api/internal/service/inquiry/agent/ego2.sys",
 		PageSize: 499,
-		Query:    "lv=info",
 	}
 	charts := searchCharts(req)
 	for i, chart := range charts {

@@ -29,7 +29,7 @@ func init() {
 func CmdFunc(cmd *cobra.Command, args []string) {
 	app := ego.New().
 		Serve(
-			egovernor.Load("server.governor").Build(),
+			egovernor.Load("agent.governor").Build(),
 			router.GetAgentRouter(),
 		)
 	err := app.Run()

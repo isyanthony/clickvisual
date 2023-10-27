@@ -116,3 +116,19 @@ func TestGenerateTestFile(t *testing.T) {
 		writer.WriteString(fmt.Sprintf(file.logCategories[pos].content+"\n", record, time.Unix(record, 0).Format("2006-01-02 15:04:05")))
 	}
 }
+
+func GenerateTestLogFile(start, end, lines int64, name string) {
+	writter, err := os.OpenFile(name, os.O_RDWR|os.O_CREATE, 0666)
+	if err != nil {
+		panic(err)
+	}
+	rands := (end - start) / lines
+	for i := int64(0); i < lines; i++ {
+		start += rand.Int63n(rands)
+		writter.WriteString(fmt.Sprintf(`{"tss":%d,"lv":"info","key":"service down","msg":"cannot support xxx operation or xxxxxxx","addr":"[xxxx service:xxxx] heartbeat down","ts":"%s"}`+"\n", start, time.Unix(start, 0).Format("2006-01-02 15:04:05")))
+	}
+}
+
+func TestGenerateFile(t *testing.T) {
+	GenerateTestLogFile(1698652360, 1698652420, 12, "12.log")
+}
